@@ -1,0 +1,170 @@
+#!/bin/bash
+#
+# vncsa-processor: This is a custom log parsing script developed 
+# to parse varnishncsa log content into separate logs based on 
+# the host that each request was made for. In order for this script
+# to work properly, you must change the log format used by 
+# varnishncsa to include the %{Host}i variable as the 3rd column
+
+# Define some variables
+#==================================================================
+# VHOST_LIST is populated on the command line by the --vhost option
+VHOST_LIST=""
+# SOURCE_LOG is from --source and defines the source of the ncsa data
+SOURCE_LOG=""
+# Where the logs are kept
+LOGDIR="/home/webmirror/log/varnish"
+# Where the vhost logs are going once they're split up
+# Defined to allow users the option to use this script in logrotate or on the command line
+POSTROTATE=0
+# As always, lets go ahead and lock so we can limit the running instances
+LOCK="/tmp/$(basename $0).lock"
+
+# Functions next
+#==================================================================
+# This is the first function we run to parse command line arguments
+check_opts()
+{
+        [ -f /etc/redhat-release ] && optprefix='^--'
+        [ $? -eq 1 ] && optprefix='--'
+        [ $# -lt 1 ] && echo "Invalid Usage!" >&2 && help >&2 && unlock 1
+        for arg do
+                if [[ $arg =~ ${optprefix} ]] ; then
+                        opt=`echo "${arg}" | sed -e 's/^--//;s/=.*//'`
+                        if [[ ${arg} =~ "=" ]] ; then
+                                optarg=`echo "${arg}" | sed -e 's/.*=//'`
+                        fi
+                        case "${opt}" in
+                                "help")
+                                        help >&2 && unlock 0
+                                ;;
+                                "vhost")
+                                        # One per virtualhost you want a separate log for
+                                        shift
+                                        [ ! -z ${optarg} ] && add_vhost ${optarg}
+                                        [ $? -eq 1 ] && echo "Please specify a virtual host!" >&2 && unlock 1
+                                ;;
+                                "source")
+                                        # Sets the source log
+                                        shift
+                                        [ "x${optarg}" != "x" ] && set_source ${optarg}
+                                        [ $? -eq 1 ] && echo "Please specify a source log!" >&2 && unlock 1
+                                ;;
+                                "prerotate")
+                                        # You can use prerotate to ident the source log instead of --source
+                                        #  but if you include a --source it will override anything passed to --prerotate
+                                        shift
+					echo "Prerotate Execution enabled..." >&2
+                                        POSTROTATE=1
+                                        [ "x${optarg}" != "x" ] && set_source ${optarg:=access.log}
+                                ;;
+                                "logdir")
+                                        # Where are the logs - Defaults to /var/log/varnish (varnishncsa default)
+                                        shift
+                                        [ "x${optarg}" != "x" ] && [ -d ${optarg} ] && LOGDIR="${optarg}"
+                                        [ $? -eq 1 ] && help >&2 && unlock 1
+                                ;;
+                                *) echo "Invalid Usage!" >&2 && help >&2 && unlock 1
+                                ;;
+                        esac
+                fi
+        done
+}
+
+# Adds Virtual Hosts defined with the --vhost option to the VHOST LIST to be processed by awk
+add_vhost()
+{
+        [ "x${VHOST_LIST}" = "x" ] && VHOST_LIST="$1" 
+        [ $? -eq 1 ] && VHOST_LIST="${VHOST_LIST},$1"
+        return 0
+}
+
+unlock()
+{
+        [ -f ${LOCK} ] && rm -f ${LOCK} && exit $1
+}
+# Sets Source Log
+set_source()
+{
+        if [ ${POSTROTATE} -gt 0 ] ;then
+		logname="$1.1"
+	else
+		logname="$1"
+	fi
+	printf "Rotating Log data in %s...\n" ${logname} >&2
+        SOURCE_LOG="${logname}" && return 0;
+}
+
+# Main function that actually does the work
+process_log()
+{
+        awk -vhosts="${VHOST_LIST}" -vdir="${LOGDIR}" '{
+                split ( hosts,vhosts,"," );
+                for ( i in vhosts ) {
+                    if ( $NF ~ vhosts[i] ) {
+                        logdir=sprintf("%s/%s",dir,vhosts[i]);
+                        # Accomodate the potential for double directory separators when user supplies path with trailing slash
+                        dds="//";
+                        gsub(dds,"/",logdir);
+                        test=system("test -d \""logdir"\"");
+                        if ( test > 0 ) {
+                            mkdir=sprintf("mkdir -p %s" , logdir);
+                            system (mkdir);
+                        }
+                        mylog=sprintf("%s/access_log",logdir);
+                        print $0 >> mylog
+                    }
+                }
+        }' $1
+}
+
+# Obligatory help function explaining how to use this script
+help()
+{
+fname=`basename $0`
+        cat << eof
+Name: $fname
+Purpose: Parse a log file in Apache ncsa format with multiple
+virtualhosts. In order for this script to work correctly,
+the hostname must be the 3rd field in the ncsa configuration
+for the log. If you run $fname on the command line on mulitple
+times on the same time, you will duplicate the output because
+we append to the vhost log. You can prevent this by manually 
+rotating the vhost logs.
+
+Usage: $fname --vhost="__HOST1__" [--vhost="__HOST2__"] --source="__SOURCE__" [other options]
+
+Options:
+        --help:         Display this help and exit
+        --vhost:        Set a virtualhost to create a separate 
+                        log file for
+        --source:       Define the source log that you want to 
+                        pull log entries from
+        --prerotate:   Option for when script is to be used as
+                        a prerotate script in logrotate
+                        This option appends ".1" to the end of
+                        the log name since the rotated log will 
+                        be renamed that way. This option can be
+                        used similarly to --source
+        --logdir:       Where is Varnish's Log. Defaults to
+                        /var/log/varnish
+eof
+}
+
+# Procedure
+#======================================================================
+
+if [ ! -f ${LOCK} ] ; then
+        touch ${LOCK}
+        check_opts $@
+        [ -d ${LOGDIR} ] && cd ${LOGDIR}
+        if [ ! -f ${SOURCE_LOG} ] ; then
+                echo "The specified log file doesn't exist! (${SOURCE_LOG})" >&2 && unlock 1 
+        fi
+        [ "x${VHOST_LIST}" != "x" ] && process_log ${SOURCE_LOG}
+        unlock 0
+else
+        echo "Lock file was never deleted. Verify that another instance is not running" >&2
+        exit 1
+fi
+
